@@ -1,61 +1,91 @@
 import tkinter as tk
 from tkinter import messagebox
 import pygetwindow as gw
-import pyautogui
 import time
+
 import win32gui
 import win32con
+import win32api
 
+# ===== 유틸 =====
 
 def get_window_list():
     """현재 열려있는 창 목록을 가져옵니다."""
     windows = gw.getAllWindows()
-    window_list = [win for win in windows if win.title]
+    window_list = [win for win in windows if win.title and win._hWnd]
     return window_list
 
-
-def bring_window_to_front(window):
-    """선택한 창을 최상위로 올리고 활성화합니다."""
+def bring_window_to_front_by_hwnd(hwnd):
+    """윈도우를 복원하고 전면으로 (활성화 여부는 앱 정책에 좌우됨)."""
     try:
-        hwnd = win32gui.FindWindow(None, window.title)
+        # 최소화된 경우 복원
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-
-        # 창의 위치 정보를 가져옵니다.
-        win_x, win_y, win_width, win_height = (
-            window.left,
-            window.top,
-            window.width,
-            window.height,
-        )
-
-        # 창의 제목 표시줄 중앙(위쪽 약간)으로 마우스를 이동 후 클릭하여 활성화합니다.
-        pyautogui.moveTo(win_x + win_width // 2, win_y + 10, duration=0.3)
-        pyautogui.click()
-        time.sleep(0.5)
+        # 포그라운드로
         win32gui.SetForegroundWindow(hwnd)
-    except Exception as e:
-        messagebox.showerror("오류", f"창을 맨 앞으로 가져올 수 없습니다:\n{e}")
+    except Exception:
+        # 포그라운드가 시스템 정책상 막힐 수 있음 → 그래도 무시
+        pass
 
+def _get_work_area_rect_for_hwnd(hwnd):
+    """창이 걸쳐있는 모니터의 '작업 영역(작업표시줄 제외)'을 반환."""
+    MONITOR_DEFAULTTONEAREST = 2
+    hmonitor = win32api.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    mi = win32api.GetMonitorInfo(hmonitor)
+    # rcWork = (left, top, right, bottom)
+    return mi["Work"] if "Work" in mi else mi["Monitor"]
 
-def drag_window_to_center(window):
-    """선택한 창을 마우스 드래그를 이용해 화면 중앙으로 이동합니다."""
-    screen_width, screen_height = pyautogui.size()
+def move_window_center_and_signal(hwnd):
+    """
+    창을 현재 위치한 모니터의 '작업 영역' 기준으로 가운데 배치하고,
+    일부 앱이 위치를 저장하도록 이동 종료 신호(WM_EXITSIZEMOVE)를 보냅니다.
+    """
+    # 현재 창 사각형
+    left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+    w, h = right - left, bottom - top
+
+    # 창이 위치한 모니터의 워크 에어리어
+    wk_left, wk_top, wk_right, wk_bottom = _get_work_area_rect_for_hwnd(hwnd)
+    wk_w, wk_h = wk_right - wk_left, wk_bottom - wk_top
+
+    # 중앙 좌표 계산
+    x = wk_left + (wk_w - w) // 2
+    y = wk_top + (wk_h - h) // 2
+
+    # 복원 및 전면으로
+    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    bring_window_to_front_by_hwnd(hwnd)
+
+    # (선택) 이동 시작 신호 흉내 — 일부 앱은 ENTER/EXIT 쌍을 좋아함
     try:
-        win_x, win_y = window.left, window.top
-        win_width, win_height = window.width, window.height
-        new_x = (screen_width - win_width) // 2
-        new_y = (screen_height - win_height) // 2
+        win32gui.PostMessage(hwnd, win32con.WM_ENTERSIZEMOVE, 0, 0)
+    except Exception:
+        pass
 
-        bring_window_to_front(window)
-        pyautogui.moveTo(win_x + win_width // 2, win_y + 10, duration=0.5)
-        pyautogui.mouseDown(button="left")
-        pyautogui.moveTo(new_x + win_width // 2, new_y + 10, duration=0.5)
-        pyautogui.mouseUp(button="left")
+    # 위치 이동 (크기 변경 없음, 활성화는 강제하지 않음)
+    flags = win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+    win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, x, y, 0, 0, flags)
 
-        messagebox.showinfo("성공", f"'{window.title}' 창을 중앙으로 이동했습니다.")
+    # 약간의 지연으로 내부 처리 여유
+    time.sleep(0.05)
+
+    # 이동 종료 신호 → 일부 앱이 이 타이밍에 위치 저장
+    try:
+        win32gui.PostMessage(hwnd, win32con.WM_EXITSIZEMOVE, 0, 0)
+    except Exception:
+        pass
+
+def center_window_by_pygetwindow_window(win):
+    """pygetwindow의 Window 객체를 받아 가운데로 이동."""
+    try:
+        hwnd = win._hWnd  # pygetwindow 내부 보관 중인 윈도우 핸들
+        if not hwnd:
+            raise RuntimeError("유효한 윈도우 핸들을 찾을 수 없습니다.")
+        move_window_center_and_signal(hwnd)
+        messagebox.showinfo("성공", f"'{win.title}' 창을 중앙으로 이동했습니다.")
     except Exception as e:
         messagebox.showerror("오류", f"창을 이동할 수 없습니다:\n{e}")
 
+# ===== Tk 앱 =====
 
 class App(tk.Tk):
     def __init__(self):
@@ -64,18 +94,15 @@ class App(tk.Tk):
         self.geometry("500x400")
         self.configure(bg="#f0f0f0")
 
-        # 타이틀 레이블
         label = tk.Label(
             self, text="열려있는 창 목록", font=("Helvetica", 14, "bold"), bg="#f0f0f0"
         )
         label.pack(pady=10)
 
-        # 창 목록을 표시할 리스트박스
         self.listbox = tk.Listbox(self, font=("Helvetica", 12), selectmode=tk.SINGLE)
         self.listbox.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
         self.listbox.bind("<Double-Button-1>", self.on_double_click)
 
-        # 버튼 프레임: 새로고침, 중앙 이동, 종료 버튼
         btn_frame = tk.Frame(self, bg="#f0f0f0")
         btn_frame.pack(pady=10)
 
@@ -119,17 +146,16 @@ class App(tk.Tk):
         return None
 
     def center_selected_window(self):
-        """선택한 창을 화면 중앙으로 이동하는 함수 호출."""
-        window = self.get_selected_window()
-        if window:
-            drag_window_to_center(window)
+        """선택한 창을 화면 중앙으로 이동."""
+        win = self.get_selected_window()
+        if win:
+            center_window_by_pygetwindow_window(win)
         else:
             messagebox.showwarning("경고", "창을 선택해주세요.")
 
     def on_double_click(self, event):
         """리스트박스 더블클릭 시 창 중앙 이동 실행."""
         self.center_selected_window()
-
 
 if __name__ == "__main__":
     app = App()
