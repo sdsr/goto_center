@@ -107,6 +107,39 @@ def get_window_size(hwnd):
     left, top, right, bottom = win32gui.GetWindowRect(hwnd)
     return (right - left, bottom - top)
 
+def get_window_position(hwnd):
+    """창의 위치(x, y)를 반환합니다. DWM 시각적 프레임 기준."""
+    fl, ft, _, _ = get_extended_frame_bounds(hwnd)
+    return (fl, ft)
+
+def apply_window_position(hwnd, target_x, target_y):
+    """
+    창을 지정된 위치로 이동합니다. 크기는 유지합니다.
+    target_x, target_y는 DWM 시각적 프레임 기준 좌표이므로
+    실제 SetWindowPos에는 그림자 패딩만큼 보정하여 전달합니다.
+    """
+    pad_left, pad_top, _, _, _, _, _, _ = get_frame_padding(hwnd)
+    outer_x = target_x - pad_left
+    outer_y = target_y - pad_top
+
+    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+    try:
+        win32gui.PostMessage(hwnd, win32con.WM_ENTERSIZEMOVE, 0, 0)
+    except Exception:
+        pass
+
+    win32gui.SetWindowPos(
+        hwnd, win32con.HWND_TOP,
+        int(outer_x), int(outer_y), 0, 0,
+        win32con.SWP_NOSIZE | win32con.SWP_NOACTIVATE
+    )
+
+    time.sleep(0.05)
+    try:
+        win32gui.PostMessage(hwnd, win32con.WM_EXITSIZEMOVE, 0, 0)
+    except Exception:
+        pass
+
 def apply_window_size(hwnd, width, height):
     """
     창에 지정된 크기를 적용합니다.
@@ -317,6 +350,8 @@ class App(tk.Tk):
         self.tk_images = {}  # hwnd -> PhotoImage
         self.saved_size = None  # (width, height) - 기억된 창 크기
         self.saved_size_title = None  # 크기를 기억한 창의 제목 (UI 표시용)
+        self.saved_position = None  # (x, y) - 기억된 창 위치
+        self.saved_position_title = None  # 위치를 기억한 창의 제목 (UI 표시용)
         self.refresh_tree()
 
         # 단축키
@@ -332,6 +367,9 @@ class App(tk.Tk):
         # 크기 복사 단축키
         self.bind("<Control-Shift-C>", lambda e: self.remember_window_size())
         self.bind("<Control-Shift-V>", lambda e: self.apply_remembered_size())
+        # 위치 복사 단축키
+        self.bind("<Control-Alt-c>", lambda e: self.remember_window_position())
+        self.bind("<Control-Alt-v>", lambda e: self.apply_remembered_position())
         # 가장자리 이동 단축키 (한 축만 이동)
         self.bind("<Alt-Up>", lambda e: self.move_selected_to_top())
         self.bind("<Alt-Down>", lambda e: self.move_selected_to_bottom())
@@ -467,6 +505,11 @@ class App(tk.Tk):
         self.size_menu.add_command(label="이 창의 크기 기억 (Ctrl+Shift+C)", command=self.remember_window_size)
         self.size_menu.add_command(label="기억된 크기 적용 (Ctrl+Shift+V)", command=self.apply_remembered_size)
         self.menu.add_cascade(label="창 크기 복사", menu=self.size_menu)
+        # 위치 복사 메뉴
+        self.position_menu = tk.Menu(self.menu, tearoff=False)
+        self.position_menu.add_command(label="이 창의 위치 기억 (Ctrl+Alt+C)", command=self.remember_window_position)
+        self.position_menu.add_command(label="기억된 위치 적용 (Ctrl+Alt+V)", command=self.apply_remembered_position)
+        self.menu.add_cascade(label="창 위치 복사", menu=self.position_menu)
         self.menu.add_separator()
         self.menu.add_command(label="닫기 (Del)", command=self.close_selected)
 
@@ -739,6 +782,48 @@ class App(tk.Tk):
             self._notify(f"'{title}' 창에 기억된 크기({width} x {height}, 원본: '{self.saved_size_title}')를 적용했습니다.")
         except Exception as e:
             messagebox.showerror("오류", f"창 크기를 적용할 수 없습니다:\n{e}")
+
+    # ----- 창 위치 복사 기능 -----
+    def remember_window_position(self, *args):
+        """선택한 창의 위치를 기억합니다."""
+        hwnd, title = self._get_selected_hwnd_and_title()
+        if not hwnd:
+            messagebox.showwarning("경고", "위치를 기억할 창을 선택해주세요.")
+            return
+
+        if not win32gui.IsWindow(hwnd):
+            messagebox.showerror("오류", "유효하지 않은 창입니다.")
+            return
+
+        try:
+            x, y = get_window_position(hwnd)
+            self.saved_position = (x, y)
+            self.saved_position_title = title
+            self._notify(f"'{title}' 창의 위치({x}, {y})를 기억했습니다. Ctrl+Alt+V로 다른 창에 적용하세요.")
+        except Exception as e:
+            messagebox.showerror("오류", f"창 위치를 가져올 수 없습니다:\n{e}")
+
+    def apply_remembered_position(self, *args):
+        """기억된 위치를 선택한 창에 적용합니다."""
+        hwnd, title = self._get_selected_hwnd_and_title()
+        if not hwnd:
+            messagebox.showwarning("경고", "위치를 적용할 창을 선택해주세요.")
+            return
+
+        if self.saved_position is None:
+            messagebox.showwarning("경고", "먼저 다른 창의 위치를 기억해주세요.\n(우클릭 -> 창 위치 복사 -> 이 창의 위치 기억)")
+            return
+
+        if not win32gui.IsWindow(hwnd):
+            messagebox.showerror("오류", "유효하지 않은 창입니다.")
+            return
+
+        try:
+            x, y = self.saved_position
+            apply_window_position(hwnd, x, y)
+            self._notify(f"'{title}' 창에 기억된 위치({x}, {y}, 원본: '{self.saved_position_title}')를 적용했습니다.")
+        except Exception as e:
+            messagebox.showerror("오류", f"창 위치를 적용할 수 없습니다:\n{e}")
 
     def _notify(self, text):
         self.status_label.config(text=text)
