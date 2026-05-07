@@ -1,10 +1,12 @@
 # -*- coding: utf-8 -*-
+import json
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, simpledialog
 import time
 import psutil
 import ctypes
 from ctypes import wintypes
+from pathlib import Path
 
 import pygetwindow as gw
 from PIL import Image, ImageTk
@@ -14,6 +16,9 @@ import win32con
 import win32api
 import win32process
 import win32ui
+
+SAVED_WINDOW_STATE_FILE = Path(__file__).with_name("goto_center_window_state.json")
+SAVED_WINDOW_PRESETS_FILE = Path(__file__).with_name("goto_center_window_presets.json")
 
 # ========= DPI 인식 (고해상도에서 흐림 방지) =========
 try:
@@ -337,6 +342,20 @@ def _tcl_safe(s: str) -> str:
     return s.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]").replace(";", "\\;")
 
 # ========= 메인 앱 =========
+def _read_int_pair(value):
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        return None
+    try:
+        return (int(value[0]), int(value[1]))
+    except (TypeError, ValueError):
+        return None
+
+def _shorten_text(text, max_len=48):
+    text = str(text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 1] + "..."
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -345,6 +364,7 @@ class App(tk.Tk):
         self.minsize(800, 520)
 
         self._build_style_light()
+        self.window_presets = []
         self._build_ui()
 
         self.tk_images = {}  # hwnd -> PhotoImage
@@ -352,6 +372,8 @@ class App(tk.Tk):
         self.saved_size_title = None  # 크기를 기억한 창의 제목 (UI 표시용)
         self.saved_position = None  # (x, y) - 기억된 창 위치
         self.saved_position_title = None  # 위치를 기억한 창의 제목 (UI 표시용)
+        self._load_saved_window_state()
+        self._refresh_preset_menu()
         self.refresh_tree()
 
         # 단축키
@@ -510,6 +532,16 @@ class App(tk.Tk):
         self.position_menu.add_command(label="이 창의 위치 기억 (Ctrl+Alt+C)", command=self.remember_window_position)
         self.position_menu.add_command(label="기억된 위치 적용 (Ctrl+Alt+V)", command=self.apply_remembered_position)
         self.menu.add_cascade(label="창 위치 복사", menu=self.position_menu)
+        # 이름을 붙여 여러 개의 크기/위치 값을 따로 저장하고 다시 적용합니다.
+        self.preset_menu = tk.Menu(self.menu, tearoff=False)
+        self.preset_menu.add_command(label="현재 크기 프리셋 저장...", command=self.save_window_size_preset)
+        self.preset_menu.add_command(label="현재 위치 프리셋 저장...", command=self.save_window_position_preset)
+        self.preset_menu.add_separator()
+        self.size_preset_apply_menu = tk.Menu(self.preset_menu, tearoff=False)
+        self.position_preset_apply_menu = tk.Menu(self.preset_menu, tearoff=False)
+        self.preset_menu.add_cascade(label="저장된 크기 프리셋 적용", menu=self.size_preset_apply_menu)
+        self.preset_menu.add_cascade(label="저장된 위치 프리셋 적용", menu=self.position_preset_apply_menu)
+        self.menu.add_cascade(label="창 크기/위치 프리셋", menu=self.preset_menu)
         self.menu.add_separator()
         self.menu.add_command(label="닫기 (Del)", command=self.close_selected)
 
@@ -523,6 +555,157 @@ class App(tk.Tk):
         self.status_label.pack(side=tk.LEFT)
 
     # ----- 데이터 로드 -----
+    def _load_saved_window_state(self):
+        state_data = self._read_json_file(SAVED_WINDOW_STATE_FILE)
+        if isinstance(state_data, dict):
+            saved_size = _read_int_pair(state_data.get("saved_size"))
+            if saved_size is not None:
+                self.saved_size = saved_size
+                self.saved_size_title = state_data.get("saved_size_title") or "저장된 창"
+
+            saved_position = _read_int_pair(state_data.get("saved_position"))
+            if saved_position is not None:
+                self.saved_position = saved_position
+                self.saved_position_title = state_data.get("saved_position_title") or "저장된 창"
+
+        self.window_presets = []
+        preset_data = self._read_json_file(SAVED_WINDOW_PRESETS_FILE)
+        raw_presets = None
+        loaded_legacy_presets = False
+        if isinstance(preset_data, dict):
+            raw_presets = preset_data.get("presets")
+        elif isinstance(preset_data, list):
+            raw_presets = preset_data
+        elif isinstance(state_data, dict):
+            raw_presets = state_data.get("presets")
+            loaded_legacy_presets = raw_presets is not None
+
+        if isinstance(raw_presets, list):
+            for index, raw_preset in enumerate(raw_presets, start=1):
+                preset = self._coerce_window_preset(raw_preset, fallback_name=f"프리셋 {index}")
+                if preset is not None:
+                    self.window_presets.append(preset)
+            if loaded_legacy_presets and self.window_presets:
+                self._save_window_presets(show_warning=False)
+
+    def _read_json_file(self, path):
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return None
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _save_saved_window_state(self):
+        data = {
+            "saved_size": list(self.saved_size) if self.saved_size is not None else None,
+            "saved_size_title": self.saved_size_title,
+            "saved_position": list(self.saved_position) if self.saved_position is not None else None,
+            "saved_position_title": self.saved_position_title,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        try:
+            with SAVED_WINDOW_STATE_FILE.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            return True
+        except OSError as e:
+            messagebox.showwarning("저장 실패", f"창 크기/위치 값을 파일에 저장하지 못했습니다:\n{e}")
+            return False
+
+    def _save_window_presets(self, show_warning=True):
+        normalized_presets = []
+        for index, preset in enumerate(self.window_presets, start=1):
+            normalized = self._coerce_window_preset(preset, fallback_name=f"프리셋 {index}")
+            if normalized is not None:
+                normalized_presets.append(normalized)
+        self.window_presets = normalized_presets
+
+        data = {
+            "presets": self.window_presets,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        try:
+            with SAVED_WINDOW_PRESETS_FILE.open("w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            return True
+        except OSError as e:
+            if show_warning:
+                messagebox.showwarning("저장 실패", f"창 프리셋을 파일에 저장하지 못했습니다:\n{e}")
+            return False
+
+    def _make_window_preset(self, name, source_title, size, position):
+        name = str(name or "").strip() or f"프리셋 {len(self.window_presets) + 1}"
+        return {
+            "name": name,
+            "source_title": str(source_title or ""),
+            "size": list(size) if size is not None else None,
+            "position": list(position) if position is not None else None,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def _coerce_window_preset(self, raw_preset, fallback_name):
+        if not isinstance(raw_preset, dict):
+            return None
+
+        size = _read_int_pair(raw_preset.get("size"))
+        position = _read_int_pair(raw_preset.get("position"))
+        if size is None and position is None:
+            return None
+
+        name = str(raw_preset.get("name") or fallback_name).strip() or fallback_name
+        return {
+            "name": name,
+            "source_title": str(raw_preset.get("source_title") or ""),
+            "size": list(size) if size is not None else None,
+            "position": list(position) if position is not None else None,
+            "updated_at": str(raw_preset.get("updated_at") or ""),
+        }
+
+    def _preset_kind(self, preset):
+        has_size = _read_int_pair(preset.get("size")) is not None
+        has_position = _read_int_pair(preset.get("position")) is not None
+        if has_size and has_position:
+            return "both"
+        if has_size:
+            return "size"
+        if has_position:
+            return "position"
+        return None
+
+    def _refresh_preset_menu(self):
+        if not hasattr(self, "size_preset_apply_menu"):
+            return
+
+        self.size_preset_apply_menu.delete(0, tk.END)
+        self.position_preset_apply_menu.delete(0, tk.END)
+        size_count = 0
+        position_count = 0
+
+        for index, preset in enumerate(self.window_presets):
+            name = _shorten_text(preset.get("name") or f"프리셋 {index + 1}")
+            size = _read_int_pair(preset.get("size"))
+            position = _read_int_pair(preset.get("position"))
+            if size is not None:
+                self.size_preset_apply_menu.add_command(
+                    label=f"{name} ({size[0]}x{size[1]})",
+                    command=lambda preset_index=index: self.apply_window_size_preset(preset_index),
+                )
+                size_count += 1
+            if position is not None:
+                self.position_preset_apply_menu.add_command(
+                    label=f"{name} ({position[0]},{position[1]})",
+                    command=lambda preset_index=index: self.apply_window_position_preset(preset_index),
+                )
+                position_count += 1
+
+        if size_count == 0:
+            self.size_preset_apply_menu.add_command(label="저장된 크기 프리셋 없음", state=tk.DISABLED)
+        if position_count == 0:
+            self.position_preset_apply_menu.add_command(label="저장된 위치 프리셋 없음", state=tk.DISABLED)
+
     def refresh_tree(self):
         query = self.search_var.get().strip().lower()
         for iid in self.tree.get_children():
@@ -741,6 +924,122 @@ class App(tk.Tk):
         move_window_to_edge(hwnd, "right", margin=0)
         self._notify(f"'{title}' 창을 맨 오른쪽으로 이동했습니다. (Y축 유지)")
 
+    # ----- 창 크기/위치 프리셋 -----
+    def save_window_size_preset(self, *args):
+        self._save_window_preset("size")
+
+    def save_window_position_preset(self, *args):
+        self._save_window_preset("position")
+
+    def _save_window_preset(self, preset_kind):
+        hwnd, title = self._get_selected_hwnd_and_title()
+        if not hwnd:
+            messagebox.showwarning("경고", "프리셋으로 저장할 창을 선택해주세요.")
+            return
+
+        if not win32gui.IsWindow(hwnd):
+            messagebox.showerror("오류", "유효하지 않은 창입니다.")
+            return
+
+        kind_label = "크기" if preset_kind == "size" else "위치"
+        default_name = _shorten_text(title, 32) or f"{kind_label} 프리셋 {len(self.window_presets) + 1}"
+        preset_name = simpledialog.askstring(
+            f"{kind_label} 프리셋 저장",
+            f"저장할 {kind_label} 프리셋 이름을 입력하세요.",
+            initialvalue=default_name,
+            parent=self,
+        )
+        if preset_name is None:
+            return
+
+        preset_name = preset_name.strip()
+        if not preset_name:
+            messagebox.showwarning("경고", "프리셋 이름을 입력해주세요.")
+            return
+
+        try:
+            size = None
+            position = None
+            if preset_kind == "size":
+                width, height = get_window_size(hwnd)
+                size = (width, height)
+                value_text = f"크기 {width} x {height}"
+            else:
+                x, y = get_window_position(hwnd)
+                position = (x, y)
+                value_text = f"위치 {x}, {y}"
+
+            preset = self._make_window_preset(preset_name, title, size, position)
+
+            existing_index = next(
+                (
+                    index
+                    for index, item in enumerate(self.window_presets)
+                    if item.get("name") == preset_name and self._preset_kind(item) == preset_kind
+                ),
+                None,
+            )
+            if existing_index is not None:
+                should_overwrite = messagebox.askyesno(
+                    "프리셋 덮어쓰기",
+                    f"'{preset_name}' {kind_label} 프리셋이 이미 있습니다.\n새 값으로 덮어쓸까요?",
+                )
+                if not should_overwrite:
+                    return
+                self.window_presets[existing_index] = preset
+            else:
+                self.window_presets.append(preset)
+
+            saved_to_file = self._save_window_presets()
+            self._refresh_preset_menu()
+            save_text = f" {SAVED_WINDOW_PRESETS_FILE.name}에 저장했습니다." if saved_to_file else " 이번 실행 동안만 기억합니다."
+            self._notify(f"'{preset_name}' {kind_label} 프리셋을 저장했습니다. {value_text}.{save_text}")
+        except Exception as e:
+            messagebox.showerror("오류", f"프리셋을 저장할 수 없습니다:\n{e}")
+
+    def apply_window_size_preset(self, preset_index):
+        self._apply_window_preset_value(preset_index, "size")
+
+    def apply_window_position_preset(self, preset_index):
+        self._apply_window_preset_value(preset_index, "position")
+
+    def _apply_window_preset_value(self, preset_index, preset_kind):
+        hwnd, title = self._get_selected_hwnd_and_title()
+        if not hwnd:
+            messagebox.showwarning("경고", "프리셋을 적용할 창을 선택해주세요.")
+            return
+
+        if not win32gui.IsWindow(hwnd):
+            messagebox.showerror("오류", "유효하지 않은 창입니다.")
+            return
+
+        if preset_index < 0 or preset_index >= len(self.window_presets):
+            messagebox.showwarning("경고", "선택한 프리셋을 찾을 수 없습니다.")
+            self._refresh_preset_menu()
+            return
+
+        preset = self.window_presets[preset_index]
+        size = _read_int_pair(preset.get("size"))
+        position = _read_int_pair(preset.get("position"))
+        kind_label = "크기" if preset_kind == "size" else "위치"
+        if preset_kind == "size" and size is None:
+            messagebox.showwarning("경고", "이 프리셋에는 적용할 크기 값이 없습니다.")
+            return
+        if preset_kind == "position" and position is None:
+            messagebox.showwarning("경고", "이 프리셋에는 적용할 위치 값이 없습니다.")
+            return
+
+        try:
+            if preset_kind == "size":
+                apply_window_size(hwnd, size[0], size[1])
+            else:
+                apply_window_position(hwnd, position[0], position[1])
+
+            preset_name = preset.get("name") or f"프리셋 {preset_index + 1}"
+            self._notify(f"'{title}' 창에 '{preset_name}' {kind_label} 프리셋을 적용했습니다.")
+        except Exception as e:
+            messagebox.showerror("오류", f"프리셋을 적용할 수 없습니다:\n{e}")
+
     # ----- 창 크기 복사 기능 -----
     def remember_window_size(self, *args):
         """선택한 창의 크기를 기억합니다."""
@@ -757,7 +1056,9 @@ class App(tk.Tk):
             width, height = get_window_size(hwnd)
             self.saved_size = (width, height)
             self.saved_size_title = title
-            self._notify(f"'{title}' 창의 크기({width} x {height})를 기억했습니다. Ctrl+Shift+V로 다른 창에 적용하세요.")
+            saved_to_file = self._save_saved_window_state()
+            save_text = f" {SAVED_WINDOW_STATE_FILE.name}에 저장했습니다." if saved_to_file else " 이번 실행 동안만 기억합니다."
+            self._notify(f"'{title}' 창의 크기({width} x {height})를 기억했습니다.{save_text} Ctrl+Shift+V로 다른 창에 적용하세요.")
         except Exception as e:
             messagebox.showerror("오류", f"창 크기를 가져올 수 없습니다:\n{e}")
 
@@ -799,7 +1100,9 @@ class App(tk.Tk):
             x, y = get_window_position(hwnd)
             self.saved_position = (x, y)
             self.saved_position_title = title
-            self._notify(f"'{title}' 창의 위치({x}, {y})를 기억했습니다. Ctrl+Alt+V로 다른 창에 적용하세요.")
+            saved_to_file = self._save_saved_window_state()
+            save_text = f" {SAVED_WINDOW_STATE_FILE.name}에 저장했습니다." if saved_to_file else " 이번 실행 동안만 기억합니다."
+            self._notify(f"'{title}' 창의 위치({x}, {y})를 기억했습니다.{save_text} Ctrl+Alt+V로 다른 창에 적용하세요.")
         except Exception as e:
             messagebox.showerror("오류", f"창 위치를 가져올 수 없습니다:\n{e}")
 
